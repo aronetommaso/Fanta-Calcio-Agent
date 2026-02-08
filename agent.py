@@ -11,6 +11,7 @@ from datapizza.core.vectorstore import VectorConfig
 from datapizza.embedders import ChunkEmbedder
 # We import the base Google class to inherit from it
 from datapizza.embedders.google import GoogleEmbedder
+from fastemb import FastEmbedder
 from datapizza.modules.parsers.docling import DoclingParser
 from datapizza.modules.splitters import RecursiveSplitter
 from datapizza.pipeline import IngestionPipeline, DagPipeline
@@ -25,7 +26,7 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 INPUT_FILE = "dataset_rag.pdf"
-GOOGLE_MODEL_NAME = "models/text-embedding-004"
+FASTEMBED_MODEL_NAME = "intfloat/multilingual-e5-large" # Modello potente multilingua (1024 dim)
 
 # --- CUSTOM COMPONENT ---
 class FixedGoogleEmbedder(GoogleEmbedder):
@@ -73,7 +74,7 @@ def main():
         return
 
     # Global configuration for Google GenAI (just to be safe)
-    genai.configure(api_key=GOOGLE_API_KEY)
+    #genai.configure(api_key=GOOGLE_API_KEY)
 
     print("--- 1. SETUP CLIENTS ---")
     
@@ -89,20 +90,20 @@ def main():
     # B. Embedder Client (Google Gemini)
     # We use our 'FixedGoogleEmbedder' wrapper.
     print("Loading Google Embedder...")
-    embedder_client = FixedGoogleEmbedder(
-        api_key=GOOGLE_API_KEY, 
-        model_name=GOOGLE_MODEL_NAME
+    print(f"Loading FastEmbedder (Local: {FASTEMBED_MODEL_NAME})...")
+    embedder_client = FastEmbedder(
+        model_name=FASTEMBED_MODEL_NAME
     )
 
     # C. Vector Database (Qdrant In-Memory)
     print("Initializing Qdrant...")
     vectorstore = QdrantVectorstore(location=":memory:")
     
-    # IMPORTANT: Google's 'text-embedding-004' produces 768-dimensional vectors.
+    # IMPORTANT: intfloat/multilingual-e5-large produces 1024-dimensional vectors.
     # Qdrant configuration must match this, otherwise calculations will fail.
     vectorstore.create_collection(
         "serie_a_matches",
-        vector_config=[VectorConfig(name="", dimensions=768)]
+        vector_config=[VectorConfig(name="", dimensions=1024)]
     )
 
     # --- 2. INGESTION PIPELINE (Loading Data) ---
@@ -126,7 +127,7 @@ def main():
             # Setting it to 50 ensures safe processing.
             ChunkEmbedder(
                 client=embedder_client, 
-                model_name=GOOGLE_MODEL_NAME,
+                model_name=FASTEMBED_MODEL_NAME,
                 batch_size=50
             ),   
         ],
@@ -147,27 +148,102 @@ def main():
     # This instructs the LLM to use only the provided context chunks.
     prompt_template = ChatPromptTemplate(
         user_prompt_template=(
-            "You are a helpful football assistant. Below is the information I found from Sky Sports.\n"
-            "Use this context to answer the user's question. If the context contains partial lineups, "
-            "report what is available. Do not apologize, just provide the data found.\n\n"
+            "Sei un assistente esperto di calcio italiano specializzato in formazioni di Serie A.\n"
+            "Usa ESCLUSIVAMENTE il contesto fornito per rispondere. Non inventare dati.\n\n"
+    
+            "### STRUTTURA DEI DATI:\n"
+            "Ogni partita contiene DUE fonti:\n"
+            "- **SOURCE 1 (Sky Sport)**: Formazione ufficiale con ruoli in inglese (Goalkeeper, Defender, Midfielder, Forward)\n"
+            "- **SOURCE 2 (Fantacalcio.it)**: Formazione alternativa con modulo (es. 4-3-3)\n\n"
+    
+            "### ISTRUZIONI CRITICHE:\n"
+            "1. **USA SEMPRE Sky Sport (SOURCE 1) come fonte primaria**\n"
+            "   - Contiene i ruoli precisi dei giocatori\n"
+            "   - È la fonte più affidabile\n\n"
             
-            "### DATA STRUCTURE RULES:\n"
-            "1. **Format**: Players are listed as 'Name Surname (Role)'.\n"
-            "2. **Fragmentation**: Names and Roles might be split across multiple lines (e.g., 'Guillermo' on one line, 'Maripán' on another, '(Defender)' on a third). You must join them logically.\n"
-            "3. **Role Persistence**: A role in parentheses applies to the name immediately preceding it, even if separated by several line breaks.\n\n"
-        
-            "### OUTPUT INSTRUCTIONS:\n"
-            "- Identify the 'STARTING LINEUP' for the requested team.\n"
-            "- Group and display players in this specific order: 1. Goalkeeper, 2. Defenders, 3. Midfielders, 4. Forwards.\n"
-            "- Use a clean bullet-point list.\n"
-            "- Answer in Italian.\n\n"
-            "--- CONTEXT START ---\n"
+            "2. **Conteggio giocatori**:\n"
+            "   - DEVONO essere esattamente 11 titolari\n"
+            "   - Se trovi meno di 11, cerca anche in SOURCE 2\n"
+            "   - Se i dati sono incompleti, dichiaralo esplicitamente\n\n"
+    
+            "3. **Mappatura ruoli (Sky Sport)**:\n"
+            "   - Goalkeeper → Portiere (1 giocatore)\n"
+            "   - Defender → Difensore (3-5 giocatori)\n"
+            "   - Midfielder → Centrocampista (3-5 giocatori)\n"
+            "   - Forward → Attaccante (1-3 giocatori)\n\n"
+    
+            "4. **Formato output obbligatorio**:\n"
+            "   ```\n"
+            "   SQUADRA (Modulo: X-X-X)\n"
+            "   \n"
+            "   Portiere:\n"
+            "   • Nome Cognome\n"
+            "   \n"
+            "   Difensori:\n"
+            "   • Nome Cognome\n"
+            "   • Nome Cognome\n"
+            "   [...]\n"
+            "   \n"
+            "   Centrocampisti:\n"
+            "   • Nome Cognome\n"
+            "   [...]\n"
+            "   \n"
+            "   Attaccanti:\n"
+            "   • Nome Cognome\n"
+            "   [...]\n"
+            "   \n"
+            "   TOTALE: X giocatori\n"
+            "   \n"
+            "   Indisponibili: [lista]\n"
+            "   Panchina: [lista]\n"
+            "   ```\n\n"
+    
+            "5. **Verifica finale**:\n"
+            "   - Conta i giocatori prima di rispondere\n"
+            "   - Scrivi 'TOTALE: X giocatori' alla fine di ogni formazione\n"
+            "   - Se non sono 11, indica il problema\n\n"
+    
+            "6. **NO invenzioni**:\n"
+            "   - Se un dato non è nel contesto, scrivi 'Non disponibile'\n"
+            "   - Non dedurre ruoli dai nomi\n"
+            "   - Non mescolare le fonti casualmente\n\n"
+    
+            "7. **Lingua**: Rispondi SEMPRE in italiano\n\n"
+    
+            "### ESEMPIO OUTPUT CORRETTO:\n"
+            "NAPOLI (Modulo: 3-4-2-1)\n"
+            "\n"
+            "Portiere:\n"
+            "• Alex Meret\n"
+            "\n"
+            "Difensori:\n"
+            "• Amir Rrahmani\n"
+            "• Alessandro Buongiorno\n"
+            "• Juan Jesus\n"
+            "\n"
+            "Centrocampisti:\n"
+            "• Mathías Olivera\n"
+            "• Stanislav Lobotka\n"
+            "• Scott McTominay\n"
+            "• Leonardo Spinazzola\n"
+            "\n"
+            "Attaccanti:\n"
+            "• Antonio Vergara\n"
+            "• Eljif Elmas\n"
+            "• Rasmus Højlund\n"
+            "\n"
+            "TOTALE: 11 giocatori ✓\n"
+            "\n"
+            "Indisponibili: Politano, Kvaratskhelia\n"
+            "Panchina: Caprile, Marin, Ngonge, Gilmour\n\n"
+    
+            "--- CONTESTO INIZIO ---\n"
             "{% for chunk in chunks %}"
             "{{ chunk.text }}\n"
             "-------------------\n"
             "{% endfor %}\n"
-            "--- CONTEXT END ---\n\n"
-            "Question: {{user_prompt}}\n"
+            "--- CONTESTO FINE ---\n\n"
+            "Domanda: {{user_prompt}}\n"
         ),
         retrieval_prompt_template=(
             "SOURCE DOCUMENTS FOUND IN PDF:\n"
@@ -198,7 +274,7 @@ def main():
 
     # --- 4. CHAT LOOP ---
     print("\n" + "="*50)
-    print(" AGENT READY! (Groq Llama 3.3 + Google Embeddings)")
+    print(" AGENT READY! (Groq qwen3-32b + multilingual-e5-large)")
     print(" Type 'exit' to quit.")
     print("="*50 + "\n")
 
